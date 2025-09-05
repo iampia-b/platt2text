@@ -17,7 +17,7 @@ The implementation provides a custom tokenizer and processor class that integrat
 
 New parameters for fine-tuning with a new language:
 - `--lang_code`: Language token (e.g., "nds")
-- `--lang_alias`: Name for the language
+- `--lang_alias`: Name for the language (e.g., "Low German")
 
 ## Acknowledgments
 
