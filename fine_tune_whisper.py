@@ -1,3 +1,10 @@
+"""
+
+Adapted from:
+- S. Gandhi, Hugging Face Blog: "Fine-Tune Whisper for Multilingual ASR with Transformers".
+
+"""
+
 import argparse, os, torch, evaluate
 from datasets import load_from_disk, Audio
 from transformers import (
