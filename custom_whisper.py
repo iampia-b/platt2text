@@ -1,6 +1,5 @@
 import os
 import json
-from typing import Optional
 from transformers import (
     WhisperProcessor, 
     WhisperTokenizer,
@@ -155,7 +154,7 @@ class CustomWhisperProcessor(WhisperProcessor):
 
 
 # function for updating models
-def update_model_for_custom_language(model, processor, lang_code: str, lang_alias: Optional[str] = None):
+def update_model_for_custom_language(model, processor, lang_code: str, lang_alias = None):
 
     # ensuring processor has the custom language
     processor.add_custom_language(lang_code, lang_alias)
