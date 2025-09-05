@@ -11,7 +11,7 @@ from custom_whisper import CustomWhisperProcessor, update_model_for_custom_langu
 
 
 def get_args():
-    p = argparse.ArgumentParser("Whisper fine‑tune with dynamic language token")
+    p = argparse.ArgumentParser()
     p.add_argument("--dataset_dir",   required=True)
     p.add_argument("--audio_column",  default="audio_filepath")
     p.add_argument("--text_column",   default="text")
@@ -49,38 +49,38 @@ set_seed(args.seed)
 torch.manual_seed(args.seed)
 
 # dataset
-ds = load_from_disk(args.dataset_dir)
+dataset = load_from_disk(args.dataset_dir)
 AUDIO_COL = args.audio_column
 TEXT_COL = args.text_column
 
-ds = ds.cast_column(AUDIO_COL, Audio(sampling_rate=args.sampling_rate))
+dataset = dataset.cast_column(AUDIO_COL, Audio(sampling_rate=args.sampling_rate))
 
 # model & CustomWhisperProcessor
 model = WhisperForConditionalGeneration.from_pretrained(MODEL_ID)
-proc = CustomWhisperProcessor.from_pretrained(MODEL_ID)
+processor = CustomWhisperProcessor.from_pretrained(MODEL_ID)
 
 # adding custom language
-model, proc = update_model_for_custom_language(
-    model, proc, 
+model, processor = update_model_for_custom_language(
+    model, processor, 
     lang_code=args.lang_code, 
     lang_alias=args.lang_alias
 )
 
 # setting language for tokenization
 language_to_use = args.lang_alias
-proc.tokenizer.set_prefix_tokens(language=language_to_use, task="transcribe")
+processor.tokenizer.set_prefix_tokens(language=language_to_use, task="transcribe")
 
 # preview tokenization (for debugging)
-preview_sample = ds["train"][0]
-enc = proc.tokenizer(preview_sample[TEXT_COL], add_special_tokens=True)
-#print("\n[preview] token IDs:", enc.input_ids)
-#print("[preview] verbatim decode:", proc.tokenizer.decode(enc.input_ids, skip_special_tokens=False))
-#print("[preview] clean decode   :", proc.tokenizer.decode(enc.input_ids, skip_special_tokens=True))
+preview_sample = dataset["train"][0]
+enc = processor.tokenizer(preview_sample[TEXT_COL], add_special_tokens=True)
+#print("\n   token IDs:", enc.input_ids)
+#print("    verbatim decode:", processor.tokenizer.decode(enc.input_ids, skip_special_tokens=False))
+#print("    clean decode   :", processor.tokenizer.decode(enc.input_ids, skip_special_tokens=True))
 
 # language token ID for data collator
 lang_token = f"<|{args.lang_code}|>"
-LANG_TOKEN_ID = proc.tokenizer.convert_tokens_to_ids(lang_token)
-print(f"\n[info] Language token '{lang_token}' has ID: {LANG_TOKEN_ID}")
+LANG_TOKEN_ID = processor.tokenizer.convert_tokens_to_ids(lang_token)
+print(f"\n  Language token '{lang_token}' has ID: {LANG_TOKEN_ID}")
 
 
 def prepare(batch):
@@ -88,19 +88,19 @@ def prepare(batch):
     audio = batch[AUDIO_COL]
 
     # compute log-Mel input features
-    batch["input_features"] = proc.feature_extractor(
+    batch["input_features"] = processor.feature_extractor(
         audio["array"], sampling_rate=audio["sampling_rate"]
     ).input_features[0]
     
     # encode target text to label ids 
-    batch["labels"] = proc.tokenizer(
+    batch["labels"] = processor.tokenizer(
         batch[TEXT_COL], add_special_tokens=True
     ).input_ids
     return batch
 
-cols = ds["train"].column_names
-print("[info] mapping dataset to input_features/labels ...")
-ds = ds.map(prepare, remove_columns=cols, num_proc=1)
+columns = dataset["train"].column_names
+print("    mapping dataset to input_features/labels ...")
+dataset = dataset.map(prepare, remove_columns=columns, num_proc=1)
 
 # data collator 
 from dataclasses import dataclass
@@ -125,7 +125,7 @@ class WhisperCollator:
         batch["labels"] = labels
         return batch
 
-collator = WhisperCollator(proc, model.config.decoder_start_token_id)
+collator = WhisperCollator(processor, model.config.decoder_start_token_id)
 
 # metrics & training 
 wer_metric = evaluate.load("wer")
@@ -133,9 +133,9 @@ wer_metric = evaluate.load("wer")
 def compute(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
-    label_ids[label_ids == -100] = proc.tokenizer.pad_token_id
-    pred_str = proc.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = proc.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
     wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
     return {"wer": wer}
 
@@ -172,19 +172,19 @@ For early stopping:
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
-    train_dataset=ds["train"],
-    eval_dataset=ds["validation"],
+    train_dataset=dataset["train"],
+    eval_dataset=dataset["validation"],
     data_collator=collator,
     compute_metrics=compute,
-    processing_class=proc.tokenizer, 
+    processing_class=processor.tokenizer, 
 )
 
 
 # saving processor before training to preserve custom config
-proc.save_pretrained(args.output_dir)
+processor.save_pretrained(args.output_dir)
 
 if __name__ == "__main__":
-    print(f"\n[INFO] Training with custom language:")
+    print(f"\ntraining with custom language:")
     print(f"  - Code: {args.lang_code}")
     print(f"  - Alias: {args.lang_alias or 'None'}")
     print(f"  - Token ID: {LANG_TOKEN_ID}")
@@ -199,7 +199,7 @@ if __name__ == "__main__":
         best_path = os.path.join(args.output_dir, "best")
         trainer.save_model(best_path)
         # save processor with best model
-        proc.save_pretrained(best_path)
+        processor.save_pretrained(best_path)
         
     print(f"\n-> Training complete!")
     print(f"-> Model saved to: {args.output_dir}")
