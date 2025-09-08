@@ -19,6 +19,15 @@ New parameters for fine-tuning with a new language:
 - `--lang_code`: Language token (e.g., "nds")
 - `--lang_alias`: Name for the language (e.g., "Low German")
 
+## Evaluation
+
+Tools for evaluating fine-tuned Whisper models and analyzing training runs.
+
+### Files
+- `model_evaluation/scripts/evaluate_wer.py` – Compute WER/CER on HF or local datasets
+- `model_evaluation/scripts/evaluate_forgetting.py` – Compare runs to assess catastrophic forgetting
+- `model_evaluation/scripts/analyze_training.py` – Summarize training dynamics (best WER, steps, runtime)
+
 ## Acknowledgments
 
 Based on the Hugging Face guide by Sanchit Gandhi: [Fine-Tune Whisper For Multilingual ASR with Transformers](https://huggingface.co/blog/fine-tune-whisper)
