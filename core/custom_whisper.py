@@ -1,5 +1,6 @@
 import os
 import json
+import torch
 from transformers import (
     WhisperProcessor, 
     WhisperTokenizer,
@@ -109,16 +110,10 @@ class CustomWhisperProcessor(WhisperProcessor):
     
     # save processor 
     def save_pretrained(self, save_directory, **kwargs):
-
-        if isinstance(self.tokenizer, (CustomWhisperTokenizer)):
-            pass
         
         return super().save_pretrained(save_directory, **kwargs)
     
-    # adding the custom language tag
-    # Example: lang_code = "nds"
-    #          lang_alias = "low_german"
-    def add_custom_language(self, lang_code, lang_alias = None):
+    def add_new_language_token(self, lang_code, lang_alias = None):
 
         lang_token = f"<|{lang_code}|>"
         
@@ -143,26 +138,34 @@ class CustomWhisperProcessor(WhisperProcessor):
         if lang_alias:
             self.tokenizer.custom_languages[lang_alias] = lang_code
         
-        return self
 
+    # adding the custom language tag
+    def add_new_language(self, model, lang_code, lang_alias = None, init_vector=None):
 
-# function for updating models
-def update_model_for_custom_language(model, processor, lang_code: str, lang_alias = None):
+        # register language 
+        self.add_new_language_token(lang_code, lang_alias)
+        tokenizer = self.tokenizer
+        new_vocab = len(tokenizer)
 
-    # ensuring processor has the custom language
-    processor.add_custom_language(lang_code, lang_alias)
-    
-    # resizing embeddings
-    if len(processor.tokenizer) != model.config.vocab_size:
-        model.resize_token_embeddings(len(processor.tokenizer))
-    
-    # updating the generation config
-    lang_token = f"<|{lang_code}|>"
-    lang_token_id = processor.tokenizer.convert_tokens_to_ids(lang_token)
-    print(f"New id: {lang_token_id} for {lang_token}")
-    if hasattr(model.generation_config, 'lang_to_id'):
-        model.generation_config.lang_to_id[lang_code] = lang_token_id
-        if lang_alias:
-            model.generation_config.lang_to_id[lang_alias] = lang_token_id
-    
-    return model, processor
+        # resizing
+        model.resize_token_embeddings(new_vocab)
+        
+        # optional init for the NEW row
+        tok = f"<|{lang_code}|>"
+        tok_id = tokenizer.convert_tokens_to_ids(tok)
+        if init_vector is not None and tok_id is not None and tok_id >= 0:
+            vec = init_vector.to(model.device)
+            with torch.no_grad():
+                model.get_input_embeddings().weight[tok_id] = vec
+                out = model.get_output_embeddings()
+                out.weight[tok_id] = vec
+
+        # update generation maps
+        if hasattr(model, "generation_config") and hasattr(model.generation_config, "lang_to_id"):
+            model.generation_config.lang_to_id[lang_code] = tok_id
+            if lang_alias:
+                model.generation_config.lang_to_id[lang_alias] = tok_id
+
+        print(f"New id: {tok_id} for {tok}")
+        return tok_id
+

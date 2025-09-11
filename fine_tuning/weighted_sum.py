@@ -1,7 +1,6 @@
 import os
 import argparse
 import torch
-import numpy as np
 import evaluate
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
@@ -15,7 +14,7 @@ from transformers import (
     set_seed,
 )
 
-from core.custom_whisper import CustomWhisperProcessor, update_model_for_custom_language
+from core.custom_whisper import CustomWhisperProcessor
 
 
 def get_args():
@@ -155,7 +154,7 @@ def compute_corpus_weighted_embedding(
     avg_probs = running_sum / n_seen
 
     # weighted sum of language embeddings
-    emb = model.model.decoder.embed_tokens.weight
+    emb = model.get_input_embeddings().weight
     lang_emb = emb[torch.tensor(language_token_ids, dtype=torch.long, device=device)]
     weighted = (avg_probs.to(device).unsqueeze(0) @ lang_emb).squeeze(0)
 
@@ -172,28 +171,6 @@ def compute_corpus_weighted_embedding(
         print(f"  {rank:2d}. {id_to_token[language_token_ids[j]]:>12} : {val:.4f}")
 
     return weighted, avg_probs, language_token_ids
-
-
-def initialize_language_with_weighted_embedding(model, processor, lang_code, lang_alias, weighted_embedding, scale):
-    model, processor = update_model_for_custom_language(
-        model=model, processor=processor, lang_code=lang_code, lang_alias=lang_alias
-    )
-
-    token = f"<|{lang_code}|>"
-    token_id = processor.tokenizer.convert_tokens_to_ids(token)
-
-    with torch.no_grad():
-        model.model.decoder.embed_tokens.weight[token_id] = weighted_embedding.to(model.device) * scale
-
-    print(f"initialized {token} (id={token_id}) with weighted embedding")
-    
-    # update generation config
-    model.generation_config.language = lang_alias or lang_code
-    model.generation_config.task = "transcribe"
-    model.generation_config.forced_decoder_ids = None
-    
-    return model, processor, token_id
-
 
 @dataclass
 class WhisperDataCollator:
@@ -223,7 +200,7 @@ def prepare_dataset(batch, processor, audio_col, text_col):
         audio["array"], sampling_rate=audio["sampling_rate"]
     ).input_features[0]
     batch["labels"] = processor.tokenizer(
-        batch[text_col], add_special_tokens=True
+        batch[text_col], add_special_tokens=False
     ).input_ids
     return batch
 
@@ -243,7 +220,6 @@ def compute_metrics(pred, processor, wer_metric):
 def main():
     args = get_args()
     set_seed(args.seed)
-    torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_id = f"openai/whisper-{args.model_size}"
@@ -272,15 +248,24 @@ def main():
         seed=args.seed,
     )
 
-    # initialize new language token
-    model, processor, token_id = initialize_language_with_weighted_embedding(
+    # reload fresh model and tokenizer to clear cached states
+    del model  
+    torch.cuda.empty_cache() 
+
+    print(f"\nReloading fresh model for training...")
+    processor = CustomWhisperProcessor.from_pretrained(model_id)
+    model = WhisperForConditionalGeneration.from_pretrained(model_id).to(device)
+
+    # add & initialize new language token
+    init_vec = weighted_embedding.to(model.device) * args.initialization_scale
+    token_id = processor.add_new_language(
         model=model,
-        processor=processor,
         lang_code=args.lang_code,
         lang_alias=args.lang_alias,
-        weighted_embedding=weighted_embedding,
-        scale=args.initialization_scale,
+        init_vector=init_vec
     )
+    print(f"initialized <|nds|> (id={token_id}) with weighted embedding")
+
 
     # setup for training
     language_to_use = args.lang_alias or args.lang_code
@@ -325,6 +310,7 @@ def main():
     # training arguments
     training_args = Seq2SeqTrainingArguments(
         output_dir=args.output_dir,
+        overwrite_output_dir=True,   
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -358,14 +344,14 @@ def main():
         eval_dataset=ds["validation"],
         data_collator=data_collator,
         compute_metrics=lambda pred: compute_metrics(pred, processor, wer_metric),
-        tokenizer=processor.tokenizer,
+        processing_class=processor.tokenizer,
         callbacks=[early_stopping],
     )
 
     print(f"starting weighted-sum training for: {language_to_use}")
     print(f"output dir: {args.output_dir}")
 
-    result = trainer.train()
+    trainer.train()
 
     # save best model
     if trainer.state.best_model_checkpoint:
