@@ -1,4 +1,3 @@
-# custom_whisper.py
 import os
 import sys
 import json
