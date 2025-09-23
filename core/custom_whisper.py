@@ -1,171 +1,240 @@
+# custom_whisper.py
 import os
+import sys
 import json
 import torch
+from pathlib import Path
 from transformers import (
     WhisperProcessor, 
     WhisperTokenizer,
-    WhisperFeatureExtractor
+    WhisperFeatureExtractor,
+    WhisperForConditionalGeneration
 )
 
-# custom whisper tokenizer, handles custom (new) language tokens
+
 class CustomWhisperTokenizer(WhisperTokenizer):
     
-    def __init__(self, *args, custom_languages = None, **kwargs):
+    def __init__(self, *args, custom_languages=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.custom_languages = custom_languages or {}
         
-    @property
-    def prefix_tokens(self):
-        bos_token_id = self.convert_tokens_to_ids("<|startoftranscript|>")
-        translate = self.convert_tokens_to_ids("<|translate|>")
-        transcribe = self.convert_tokens_to_ids("<|transcribe|>")
-        notimestamps = self.convert_tokens_to_ids("<|notimestamps|>")
-        
-        prefix = [bos_token_id]
-        
-        if self.language is not None:
-            # check if language is new
-            lang_code = self.custom_languages.get(self.language, self.language)
-            lang_token = f"<|{lang_code}|>"
-            
-            lang_id = self.convert_tokens_to_ids(lang_token)
-            if lang_id != self.unk_token_id: # check lang token is a known token
-                prefix.append(lang_id)
-        
-        if self.task is not None:
-            if self.task == "transcribe":
-                prefix.append(transcribe)
-            elif self.task == "translate":
-                prefix.append(translate)
-        
-        if not self.predict_timestamps:
-            prefix.append(notimestamps)
-            
-        return prefix
-
     def save_pretrained(self, save_directory, **kwargs):
-        # saving the tokenizer
         outputs = super().save_pretrained(save_directory, **kwargs)
         
-        # saving language mappings and tokenizer class info
-        tokenizer_config_file = os.path.join(save_directory, "tokenizer_config.json")
-        if os.path.exists(tokenizer_config_file):
-            with open(tokenizer_config_file, 'r', encoding='utf-8') as f:
+        # saving custom language info
+        config_file = os.path.join(save_directory, "tokenizer_config.json")
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
                 config = json.load(f)
             
             config["tokenizer_class"] = "CustomWhisperTokenizer"
             config["custom_languages"] = self.custom_languages
             
-            with open(tokenizer_config_file, 'w', encoding='utf-8') as f:
+            with open(config_file, 'w') as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
                 
         return outputs
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *init_inputs, **kwargs):
-        # if tokenizer_config available
-        tokenizer_config_file = os.path.join(pretrained_model_name_or_path, "tokenizer_config.json")
-        custom_languages = {}
+    def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
+        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
         
-        if os.path.exists(tokenizer_config_file):
-            with open(tokenizer_config_file, 'r', encoding='utf-8') as f:
+        # loading custom languages if present
+        config_file = os.path.join(pretrained_model_name_or_path, "tokenizer_config.json")
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
                 config = json.load(f)
-                custom_languages = config.get("custom_languages", {})
-        
-        tokenizer = super().from_pretrained(pretrained_model_name_or_path, *init_inputs, **kwargs)
-        
-        # set custom languages
-        tokenizer.custom_languages = custom_languages
+                tokenizer.custom_languages = config.get("custom_languages", {})
         
         return tokenizer
 
 
-# custom whisper processor, uses CustomWhisperTokenizer
 class CustomWhisperProcessor(WhisperProcessor):
-
+    # processor that uses CustomWhisperTokenizer and handles language token addition
+    
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-
-        # check if model uses custom languages
-        tokenizer_config_file = os.path.join(pretrained_model_name_or_path, "tokenizer_config.json")
-        use_custom_tokenizer = False
+        feature_extractor = WhisperFeatureExtractor.from_pretrained(
+            pretrained_model_name_or_path, **kwargs
+        )
         
-        if os.path.exists(tokenizer_config_file):
-            with open(tokenizer_config_file, 'r', encoding='utf-8') as f:
+        # check for custom tokenizer
+        config_file = os.path.join(pretrained_model_name_or_path, "tokenizer_config.json")
+        use_custom = False
+        
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
                 config = json.load(f)
-                if config.get("tokenizer_class") in ["CustomWhisperTokenizer"]:
-                    use_custom_tokenizer = True
-            
-        feature_extractor = WhisperFeatureExtractor.from_pretrained(pretrained_model_name_or_path, **kwargs)
+                if config.get("tokenizer_class") == "CustomWhisperTokenizer":
+                    use_custom = True
         
-        # load tokenizer
-        if use_custom_tokenizer:
-            tokenizer_class = CustomWhisperTokenizer
-            tokenizer = tokenizer_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
+        if use_custom:
+            tokenizer = CustomWhisperTokenizer.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
         else:
-            # standard tokenizer
-            tokenizer = WhisperTokenizer.from_pretrained(pretrained_model_name_or_path, **kwargs)
+            tokenizer = WhisperTokenizer.from_pretrained(
+                pretrained_model_name_or_path, **kwargs
+            )
         
         return cls(feature_extractor=feature_extractor, tokenizer=tokenizer)
     
-    # save processor 
-    def save_pretrained(self, save_directory, **kwargs):
+    def add_language_token(self, model, lang_code, init_vector=None):
         
-        return super().save_pretrained(save_directory, **kwargs)
-    
-    def add_new_language_token(self, lang_code, lang_alias = None):
-
+        lang_code = lang_code.strip().lower()
+        
         lang_token = f"<|{lang_code}|>"
         
-        # custom tokenizer if needed
-        if not isinstance(self.tokenizer, (CustomWhisperTokenizer)):
-            tokenizer_class = CustomWhisperTokenizer
-            
-            # new instance with same config
-            custom_tokenizer = tokenizer_class.__new__(tokenizer_class)
-            custom_tokenizer.__dict__.update(self.tokenizer.__dict__)
-            custom_tokenizer.custom_languages = {}
-            self.tokenizer = custom_tokenizer
-        
-        # adding the language token if needed
-        if lang_token not in self.tokenizer.get_vocab():
-            existing_specials = self.tokenizer.additional_special_tokens
+        # add token if not present
+        special_tokens = self.tokenizer.special_tokens_map.get("additional_special_tokens", [])
+        if lang_token not in special_tokens:
             self.tokenizer.add_special_tokens({
-                "additional_special_tokens": existing_specials + [lang_token]
+                "additional_special_tokens": special_tokens + [lang_token]
             })
+            print(f"Added token: {lang_token}")
         
-        # register the alias
-        if lang_alias:
-            self.tokenizer.custom_languages[lang_alias] = lang_code
+        # resizing embeddings
+        before = model.model.decoder.embed_tokens.weight.shape[0]
+        model.resize_token_embeddings(len(self.tokenizer))
+        after = model.model.decoder.embed_tokens.weight.shape[0]
+        print(f"Decoder embeddings: {before} -> {after}")
         
-
-    # adding the custom language tag
-    def add_new_language(self, model, lang_code, lang_alias = None, init_vector=None):
-
-        # register language 
-        self.add_new_language_token(lang_code, lang_alias)
-        tokenizer = self.tokenizer
-        new_vocab = len(tokenizer)
-
-        # resizing
-        model.resize_token_embeddings(new_vocab)
+        # token ID
+        token_id = self.tokenizer.convert_tokens_to_ids(lang_token)
         
-        # optional init for the NEW row
-        tok = f"<|{lang_code}|>"
-        tok_id = tokenizer.convert_tokens_to_ids(tok)
-        if init_vector is not None and tok_id is not None and tok_id >= 0:
-            vec = init_vector.to(model.device)
+        # optional initialization vector
+        if init_vector is not None and token_id >= 0:
             with torch.no_grad():
-                model.get_input_embeddings().weight[tok_id] = vec
-                out = model.get_output_embeddings()
-                out.weight[tok_id] = vec
+                model.get_input_embeddings().weight[token_id] = init_vector.to(model.device)
+                model.get_output_embeddings().weight[token_id] = init_vector.to(model.device)
+        
+        # updating generation_config.lang_to_id
+        if hasattr(model, "generation_config"):
+            if not hasattr(model.generation_config, "lang_to_id"):
+                model.generation_config.lang_to_id = {}
+            elif model.generation_config.lang_to_id is None:
+                model.generation_config.lang_to_id = {}
+            
+            model.generation_config.lang_to_id[lang_token] = int(token_id)
+        
+        print(f"Token ID for {lang_token}: {token_id}")
+        return token_id
 
-        # update generation maps
-        if hasattr(model, "generation_config") and hasattr(model.generation_config, "lang_to_id"):
-            model.generation_config.lang_to_id[lang_code] = tok_id
-            if lang_alias:
-                model.generation_config.lang_to_id[lang_alias] = tok_id
 
-        print(f"New id: {tok_id} for {tok}")
-        return tok_id
+def setup_model_with_custom_language(model_name, lang_code):
+    
+    processor = CustomWhisperProcessor.from_pretrained(model_name)
+    model = WhisperForConditionalGeneration.from_pretrained(model_name)
+    
+    token_id = processor.add_language_token(model, lang_code)
+    
+    prefix_tokens = get_prefix_tokens(processor.tokenizer, lang_code)
+    prefix_pos_id = [[i, t] for i, t in enumerate(prefix_tokens)]
 
+    model.generation_config.forced_decoder_ids = prefix_pos_id
+    model.config.forced_decoder_ids = prefix_pos_id
+
+    return model, processor, token_id
+
+
+def get_prefix_tokens(tokenizer, language=None, task="transcribe", no_timestamps=True):
+
+    # building prefix token sequence for testing
+    ids = [tokenizer.convert_tokens_to_ids("<|startoftranscript|>")]
+    if language:
+        ids.append(tokenizer.convert_tokens_to_ids(f"<|{language}|>"))
+    if task:
+        ids.append(tokenizer.convert_tokens_to_ids(f"<|{task}|>"))
+    if no_timestamps:
+        ids.append(tokenizer.convert_tokens_to_ids("<|notimestamps|>"))
+    return ids
+
+
+def main():
+
+    # testing for custom language token addition
+
+    model_name = sys.argv[1] if len(sys.argv) > 1 else "openai/whisper-tiny"
+    out_dir = sys.argv[2] if len(sys.argv) > 2 else "test_custom_tokenizer"
+    lang_code = sys.argv[3] if len(sys.argv) > 3 else "xx"
+
+    print(f"Testing CustomWhisperProcessor with new language token")
+
+    # load and setup
+    print(f"\nLoading {model_name}...")
+    model, processor, token_id = setup_model_with_custom_language(
+        model_name, lang_code
+    )
+    
+    # display info
+    print(f"\nInitial setup:")
+    print(f"    Vocab size: {len(processor.tokenizer)}")
+    print(f"    Decoder embeddings: {model.model.decoder.embed_tokens.weight.shape}")
+    print(f"    Token <|{lang_code}|> ID: {token_id}")
+    
+    # checking generation config
+    print(f"    Lang_to_id entries: \n{len(model.generation_config.lang_to_id)}")
+    if f"<|{lang_code}|>" in model.generation_config.lang_to_id:
+        print(f"    <|{lang_code}|> -> {model.generation_config.lang_to_id[f'<|{lang_code}|>']}")
+        print(f"    model.generation_config.forced_decoder_ids = {model.generation_config.forced_decoder_ids}")
+        print(f"    model.config.forced_decoder_ids = {model.config.forced_decoder_ids}")
+        
+    
+    # testing prefix generation
+    print(f"\nTesting prefix generation:")
+    prefix = get_prefix_tokens(processor.tokenizer, language=lang_code)
+    print(f"    Prefix token IDs: {prefix}")
+    prefix_tokens = [processor.tokenizer.convert_ids_to_tokens(id) for id in prefix]
+    print(f"    Prefix tokens: {prefix_tokens}")
+    
+    # testing encoding/decoding
+    print(f"\nTesting encoding/decoding:")
+    test_text = "Hello world, this is a test."
+    core_ids = processor.tokenizer.encode(test_text, add_special_tokens=False)
+    full_ids = prefix + core_ids + [processor.tokenizer.eos_token_id]
+    decoded = processor.tokenizer.decode(full_ids, skip_special_tokens=False)
+    print(f"    Input: {test_text}")
+    print(f"    Token IDs (first 10): {full_ids[:10]}...")
+    print(f"    Decoded: {decoded[:80]}...")
+    
+    # saving
+    print(f"\nSaving to {out_dir}...")
+    Path(out_dir).mkdir(exist_ok=True)
+    processor.save_pretrained(out_dir)
+    model.save_pretrained(out_dir)
+    
+    # saved files
+    print(f"\nSaved files:")
+    for file in sorted(os.listdir(out_dir)):
+        size = os.path.getsize(os.path.join(out_dir, file))
+        print(f"  {file:30} ({size:,} bytes)")
+    
+    # reloading
+    print(f"\nVerifying reload...")
+    new_processor = CustomWhisperProcessor.from_pretrained(out_dir)
+    new_model = WhisperForConditionalGeneration.from_pretrained(out_dir)
+    
+    # checking token
+    try:
+        reloaded_id = new_processor.tokenizer.convert_tokens_to_ids(f"<|{lang_code}|>")
+        print(f"    Token <|{lang_code}|> found with ID: {reloaded_id}")
+    except:
+        print(f"    Token <|{lang_code}|> not found!")
+    
+    # checking custom languages
+    if hasattr(new_processor.tokenizer, 'custom_languages'):
+        print(f"    Custom languages: {new_processor.tokenizer.custom_languages}")
+    
+    # checking generation config
+    if hasattr(new_model.generation_config, "lang_to_id"):
+        print(f"    <|{lang_code}|> -> {model.generation_config.lang_to_id[f'<|{lang_code}|>']}")
+        print(f"    model.generation_config.forced_decoder_ids = {model.generation_config.forced_decoder_ids}")
+        print(f"    model.config.forced_decoder_ids = {model.config.forced_decoder_ids}")
+    
+    print(f"\nFinal stats:")
+    print(f"    Vocab size: {len(new_processor.tokenizer)}")
+    print(f"    Embeddings: {new_model.model.decoder.embed_tokens.weight.shape}")
+
+
+if __name__ == "__main__":
+    main()
