@@ -14,12 +14,18 @@ platt2text/
 │   └── custom_whisper.py       # Custom Whisper tokenizer and processor for new language tokens
 ├── fine_tuning/           
 │   ├── standard.py                         # Standard fine-tuning with custom language tokens
-│   └── weighted_sum.py                     # Weighted-sum initialization for better zero-shot performance
-│   └── elastic_weight_consolidation.py     # to be uploaded
+│   └── ws_ft.py                            # Weighted-sum initialization for better zero-shot performance
+│   └── ewc_ft.py                           # Elastic Weight Consolidation to reduce catastrophic forgetting
+│   └── ewc_calc.py                         # calculation of fisher information for ewc
+│   └── ewc_trainer.py                      # trainer for ewc_ft
 └── evaluation/
-    ├── eval_error_rates.py                 # WER/CER evaluation on test sets
-    ├── eval_catastrophic_forgetting.py     # Catastrophic forgetting analysis
-    └── eval_training.py                    # Training dynamics and convergence analysis
+│   ├── eval_error_rates.py                 # WER/CER evaluation on test sets
+│   ├── eval_catastrophic_forgetting.py     # Catastrophic forgetting analysis
+│   └── eval_training.py                    # Training dynamics and convergence analysis
+│   └── compare_embeddings.py               # Comparison of language embeddings using cosine similarity
+└── utils/
+    └── data_handling.py                    # Utilities for loading and preprocessing speech datasets (local HF datasets and Common Voice TSVs)
+    └── ft_utils.py                         # Helper functions for setting up a custom-language Whisper model for fine-tuning
 ```
 
 ## Requirements
