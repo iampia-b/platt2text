@@ -3,7 +3,7 @@ import json
 import re
 
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List
 
 import pandas as pd
 import evaluation.plot_eval as plot_eval
