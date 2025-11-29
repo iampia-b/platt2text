@@ -1,186 +1,104 @@
+import os
 import argparse
-import torch
-import pandas as pd
-import evaluate
 from pathlib import Path
-from tqdm import tqdm
 from datasets import load_dataset, Audio
-from transformers import WhisperForConditionalGeneration, pipeline
 
-from core.custom_whisper import CustomWhisperProcessor
+import evaluation.eval_error_rates as eval_model
+import evaluation.eval_training as eval_train
 
 
-def evaluate_on_german(model_path, test_dataset, args):
-    device = args.device
-    
-    # load model
-    print(f"  loading model from {model_path}")
-    model = WhisperForConditionalGeneration.from_pretrained(model_path).to(device)
-    processor = CustomWhisperProcessor.from_pretrained(model_path)
-    
-    # force german decoding
-    processor.tokenizer.set_prefix_tokens(language="de", task="transcribe")
-    
-    # create pipeline
-    pipe = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        device=device,
-        torch_dtype=torch.float16 if args.fp16 else torch.float32,
+def load_local_cv_dataset(root_dir, split, sample_limit= 500, seed = 42, audio_column = "audio", text_column = "sentence"):
+
+    # load TSV metadata as a dataset
+    split_tsv = split+".tsv"
+    tsv_path = os.path.join(root_dir, split_tsv)
+
+    ds_dict = load_dataset(
+        "csv",
+        data_files={"data": tsv_path},
+        delimiter="\t",
     )
-    
-    # metrics
-    wer_metric = evaluate.load("wer")
-    cer_metric = evaluate.load("cer")
-    
-    predictions = []
-    references = []
-    
-    # evaluate
-    for sample in tqdm(test_dataset, desc="testing on german", leave=False):
-        audio = sample["audio"]["array"]
-        reference = sample["text"]
-        
-        # force german decoding
-        result = pipe(audio, generate_kwargs={"language": "de"})
-        prediction = result["text"]
-        
-        predictions.append(prediction)
-        references.append(reference)
-    
-    # calculate metrics
-    wer = wer_metric.compute(predictions=predictions, references=references) * 100
-    cer = cer_metric.compute(predictions=predictions, references=references) * 100
-    
-    return {
-        "wer": wer,
-        "cer": cer,
-        "predictions": predictions,
-        "references": references
-    }
+    ds = ds_dict["data"] 
+
+    def _add_fields(batch):
+
+        abs_paths = [os.path.join(root_dir, "clips", rel) for rel in batch["path"]]
+        transcripts = batch["sentence"]
+
+        batch[audio_column] = abs_paths
+        batch[text_column] = transcripts
+        return batch
+
+    ds = ds.map(_add_fields, batched=True)
+    ds = ds.cast_column(audio_column, Audio(sampling_rate=16000))
+
+    ds = ds.shuffle(seed=seed)
+    if sample_limit is not None:
+        n = min(sample_limit, len(ds))
+        ds = ds.select(range(n))
+
+    keep_cols = [c for c in [audio_column, text_column] if c in ds.column_names]
+    ds = ds.select_columns(keep_cols)
+
+    print(f"{split_tsv} loaded from {root_dir}")
+    print(f"final size: {len(ds)} samples")
+    return ds
 
 
 def main():
     parser = argparse.ArgumentParser()
     
     # model paths
-    parser.add_argument("--model_dir", type=Path, required=True,
-                       help="directory with trained models")
-    parser.add_argument("--baseline_model", type=Path,
-                       help="german baseline model for comparison")
+    parser.add_argument("--model_dir", type=Path, required=True)
+    parser.add_argument("--baseline_model", required=True)
     
     # test dataset (german)
-    parser.add_argument("--dataset", default="mozilla-foundation/common_voice_17_0")
-    parser.add_argument("--config", default="de")
+    parser.add_argument("--dataset_path", default="mozilla-foundation/common_voice_17_0")
     parser.add_argument("--split", default="test")
-    parser.add_argument("--sample_limit", type=int, default=500,
-                       help="number of test samples")
+    parser.add_argument("--sample_limit", type=int, default=900)
+
+    parser.add_argument("--audio_column", default="audio")
+    parser.add_argument("--text_column", default="sentence")
     
-    # settings
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--fp16", action="store_true")
+    # output
     parser.add_argument("--output_dir", type=Path, required=True)
-    
+
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     
     # load german test set
-    print("loading german test dataset...")
-    test_dataset = load_dataset(args.dataset, args.config, split=args.split)
-    if args.sample_limit:
-        test_dataset = test_dataset.select(range(min(args.sample_limit, len(test_dataset))))
-    test_dataset = test_dataset.cast_column("audio", Audio(sampling_rate=16000))
-    print(f"test set size: {len(test_dataset)} samples")
-    
-    # evaluate baseline
-    baseline_wer = None
-    if args.baseline_model and args.baseline_model.exists():
-        print("\nevaluating baseline german model...")
-        baseline_results = evaluate_on_german(args.baseline_model, test_dataset, args)
-        baseline_wer = baseline_results["wer"]
-        print(f"baseline german wer: {baseline_wer:.2f}%")
-    
-    # find all models to test
-    model_paths = []
-    for path in args.model_dir.rglob("*/best"):
-        if path.is_dir() and (path / "config.json").exists():
-            model_paths.append(path)
-    
-    print(f"\nfound {len(model_paths)} models to evaluate for forgetting")
+    test_dataset = load_local_cv_dataset(args.dataset_path, args.split, args.sample_limit, 42, args.audio_column, args.text_column)
+
+    # find models
+    model_paths = eval_model.find_model_paths(args.baseline_model, args.model_dir)
     
     # evaluate each model
     results = []
+
     for model_path in model_paths:
-        model_name = model_path.parent.name
-        print(f"\nevaluating {model_name}...")
-        
-        # check if this is a low german model
-        is_low_german = "nds" in model_name or "low_german" in model_name
+        model_name = model_path if isinstance(model_path, Path) else Path(model_path)
+        print(f"\nevaluating {model_name.name}...")
         
         try:
-            metrics = evaluate_on_german(model_path, test_dataset, args)
+            metrics, predictions, references = eval_model.evaluate_model(model_path, test_dataset, args.audio_column, args.text_column, "de")
+            lang_guess, lr_float, lr_str = eval_train.parse_lang_lr_seed(model_name)
+
+            # prefer explicit eval lang over guessed
+            metrics["eval_language"] = metrics.get("eval_language") or None
+            metrics["train_language"] = lang_guess
+            metrics["learning_rate"] = lr_float
+
+            results.append(metrics)
             
-            result = {
-                "model": model_name,
-                "model_path": str(model_path),
-                "is_low_german": is_low_german,
-                "german_wer": metrics["wer"],
-                "german_cer": metrics["cer"],
-            }
+            eval_model.save_model_results(references, predictions, model_name, args.output_dir, metrics)
             
-            # calculate forgetting if baseline available
-            if baseline_wer is not None:
-                result["forgetting"] = metrics["wer"] - baseline_wer
-            
-            results.append(result)
-            
-            # save predictions
-            pred_df = pd.DataFrame({
-                "reference": metrics["references"],
-                "prediction": metrics["predictions"]
-            })
-            pred_file = args.output_dir / f"german_predictions_{model_name}.csv"
-            pred_df.to_csv(pred_file, index=False)
-            
-            print(f"  german wer: {metrics['wer']:.2f}%")
-            if baseline_wer:
-                forgetting = metrics["wer"] - baseline_wer
-                print(f"  forgetting: {forgetting:+.2f}% vs baseline")
-                
         except Exception as e:
-            print(f"  failed: {e}")
+            print(f"  failed to evaluate: {e}")
             continue
     
-    # save and display results
+    # save summary results
     if results:
-        df = pd.DataFrame(results)
-        df = df.sort_values("german_wer")
-        df.to_csv(args.output_dir / "forgetting_analysis.csv", index=False)
-        
-        print("catastrophic forgetting analysis")
-        
-        # separate by model type
-        if "is_low_german" in df.columns:
-            low_german_models = df[df["is_low_german"]]
-            german_models = df[~df["is_low_german"]]
-            
-            if not low_german_models.empty:
-                print("\nlow german models on german test:")
-                print(low_german_models[["model", "german_wer", "forgetting"]].to_string(index=False))
-                avg_wer = low_german_models["german_wer"].mean()
-                print(f"\naverage wer: {avg_wer:.2f}%")
-                
-                if "forgetting" in low_german_models.columns:
-                    avg_forgetting = low_german_models["forgetting"].mean()
-                    print(f"average forgetting: {avg_forgetting:+.2f}%")
-            
-            if not german_models.empty:
-                print("\ngerman models on german test (sanity check):")
-                print(german_models[["model", "german_wer"]].to_string(index=False))
-        else:
-            print(df.to_string(index=False))
+        eval_model.save_results_summary(results, args.output_dir)
 
 
 if __name__ == "__main__":

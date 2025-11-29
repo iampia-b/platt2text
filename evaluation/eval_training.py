@@ -1,210 +1,250 @@
 import argparse
 import json
-import pandas as pd
+import re
+
 from pathlib import Path
+from typing import Dict, Any, List, Optional, Tuple
 
+import pandas as pd
+import evaluation.plot_eval as plot_eval
 
-def parse_trainer_state(state_file):
-    # extract metrics from trainer_state.json
-    with open(state_file, 'r') as f:
-        state = json.load(f)
-    
-    metrics = {
-        "best_metric": state.get("best_metric"),
-        "best_model_checkpoint": state.get("best_model_checkpoint"),
-        "global_step": state.get("global_step"),
-        "epoch": state.get("epoch"),
-    }
-    
-    # extract training history
-    log_history = state.get("log_history", [])
-    
-    # find best wer and convergence step
-    eval_wers = []
-    train_losses = []
-    
-    for entry in log_history:
-        if "eval_wer" in entry:
-            eval_wers.append({
-                "step": entry["step"],
-                "wer": entry["eval_wer"],
-                "loss": entry.get("eval_loss")
-            })
-        if "loss" in entry and "eval_wer" not in entry:
-            train_losses.append({
-                "step": entry["step"],
-                "loss": entry["loss"],
-                "learning_rate": entry.get("learning_rate")
-            })
-    
-    if eval_wers:
-        wer_df = pd.DataFrame(eval_wers)
-        metrics["best_wer"] = wer_df["wer"].min()
-        metrics["best_wer_step"] = wer_df.loc[wer_df["wer"].idxmin(), "step"]
-        metrics["final_wer"] = eval_wers[-1]["wer"]
-        metrics["wer_improvement"] = eval_wers[0]["wer"] - metrics["best_wer"]
-        
-        # calculate convergence (step where wer stops improving significantly)
-        wer_values = wer_df["wer"].values
-        if len(wer_values) > 3:
-            # find where improvement plateaus (< 1% improvement over 3 evals)
-            for i in range(3, len(wer_values)):
-                recent_improvement = wer_values[i-3] - wer_values[i]
-                if recent_improvement < 1.0:  # less than 1% wer improvement
-                    metrics["convergence_step"] = wer_df.iloc[i]["step"]
-                    break
-    
-    if train_losses:
-        loss_df = pd.DataFrame(train_losses)
-        metrics["final_train_loss"] = train_losses[-1]["loss"]
-        metrics["min_train_loss"] = loss_df["loss"].min()
-    
-    return metrics
+LR_RE = re.compile(r"^\d+e-?\d+$")  # 3e-5, 1e-6, 5e-05
 
-
-def analyze_experiment(exp_dir):
-    # analyze a single experiment directory
-    exp_path = Path(exp_dir)
+def parse_lang_lr_seed(run_dir):
     
-    results = {
-        "experiment": exp_path.name,
-        "path": str(exp_path)
-    }
-    
-    # find trainer state files
-    for subdir in ["best", "final", ""]:
-        state_file = exp_path / subdir / "trainer_state.json"
-        if state_file.exists():
-            metrics = parse_trainer_state(state_file)
-            results.update(metrics)
-            break
-    
-    # check for weighted-sum metadata
-    ws_meta = exp_path / "best" / "ws_train_meta.pt"
-    if ws_meta.exists():
-        results["method"] = "weighted_sum"
+    if run_dir.name == "best":
+        parts = run_dir.parent.name.split("_")
     else:
-        results["method"] = "standard"
-    
-    # extract experiment parameters from name if structured
-    name = exp_path.name
-    if "_" in name:
-        parts = name.split("_")
-        for part in parts:
-            if "seed" in part:
-                try:
-                    results["seed"] = int(part.replace("seed", ""))
-                except:
-                    pass
-            elif part in ["german", "low-german", "nds", "de"]:
-                results["language"] = part
-    
-    return results
+        parts = run_dir.name.split("_")
+    lang = parts[0] if parts else None
+
+    lr = None
+    for p in parts:
+        if LR_RE.fullmatch(p):
+            try:
+                lr = float(p)
+            except Exception:
+                lr = None
+            break
+
+    seed = parts[-2] if len(parts) >= 3 and parts[-2].isdigit() else None
+    return lang, lr, seed
+
+
+def find_state_file(run_dir):
+
+    for sub in ("best", "final"):
+        p = run_dir / sub / "trainer_state.json"
+        if p.exists():
+            return p
+
+    best_ckpt, best_step = None, -1
+    for ckpt in run_dir.glob("checkpoint-*"):
+        if not ckpt.is_dir():
+            continue
+        try:
+            step = int(ckpt.name.split("-")[1])
+        except Exception:
+            continue
+        cand = ckpt / "trainer_state.json"
+        if cand.exists() and step > best_step:
+            best_step, best_ckpt = step, cand
+    return best_ckpt
+
+
+def parse_trainer_state_to_steps_df(state_file):
+
+    with open(state_file, "r") as f:
+        state = json.load(f)
+
+    # per-step rows
+    by_step: Dict[int, Dict[str, Any]] = {}
+    for entry in state.get("log_history", []) or []:
+        step = entry.get("step")
+        if step is None:
+            continue
+        step = int(step)
+        row = by_step.setdefault(step, {"step": step})
+
+        # evaluation logs
+        if "eval_wer" in entry:
+            row["wer"] = entry.get("eval_wer")
+            row["eval_loss"] = entry.get("eval_loss")
+
+        # training logs
+        if "loss" in entry and "eval_wer" not in entry:
+            row["train_loss"] = entry.get("loss")
+            row["log_learning_rate"] = entry.get("learning_rate")
+
+    if not by_step:
+        df = pd.DataFrame([{
+            "step": None,
+            "wer": None,
+            "eval_loss": None,
+            "train_loss": None,
+            "log_learning_rate": None,
+        }])
+    else:
+        df = pd.DataFrame(sorted(by_step.values(), key=lambda d: (d["step"] is None, d["step"])))
+
+    # attach trainer-level fields
+    df["best_metric"] = state.get("best_metric")
+    df["best_model_checkpoint"] = state.get("best_model_checkpoint")
+    df["global_step"] = state.get("global_step")
+    df["epoch"] = state.get("epoch")
+
+    # compute run summaries from eval rows
+    eval_mask = df["wer"].notna()
+    if eval_mask.any():
+        eval_df = df.loc[eval_mask].sort_values("step")
+        best_idx = eval_df["wer"].idxmin()
+        best_row = eval_df.loc[best_idx]
+        df["best_wer"] = float(best_row["wer"])
+        df["best_wer_step"] = int(best_row["step"])
+        df["final_wer"] = float(eval_df.iloc[-1]["wer"])
+        first_wer = float(eval_df.iloc[0]["wer"])
+        df["wer_improvement"] = first_wer - float(best_row["wer"])
+
+        # convergence: absolute improvement < 1.0 across 3 evals
+        conv_step = None
+        if len(eval_df) > 3:
+            vals = eval_df["wer"].to_list()
+            steps = eval_df["step"].to_list()
+            for i in range(3, len(vals)):
+                if (vals[i - 3] - vals[i]) < 1.0:
+                    conv_step = int(steps[i])
+                    break
+        df["convergence_step"] = conv_step
+    else:
+        df["best_wer"] = None
+        df["best_wer_step"] = None
+        df["final_wer"] = None
+        df["wer_improvement"] = None
+        df["convergence_step"] = None
+
+    # summaries
+    if "train_loss" in df and df["train_loss"].notna().any():
+        train_df = df.loc[df["train_loss"].notna()].sort_values("step")
+        df["final_train_loss"] = float(train_df.iloc[-1]["train_loss"])
+        df["min_train_loss"] = float(train_df["train_loss"].min())
+    else:
+        df["final_train_loss"] = None
+        df["min_train_loss"] = None
+
+    return df
+
+
+def analyze_run_dir(run_dir):
+
+    language, lr, seed = parse_lang_lr_seed(run_dir)
+    method = "weighted_sum" if (run_dir / "ws_train_meta.pt").exists() else "standard"
+
+    state_file = find_state_file(run_dir)
+    if state_file is None:
+        return pd.DataFrame([{
+            "step": None, "wer": None, "eval_loss": None,
+            "train_loss": None, "log_learning_rate": None,
+            "best_metric": None, "best_model_checkpoint": None,
+            "global_step": None, "epoch": None,
+            "best_wer": None, "best_wer_step": None,
+            "final_wer": None, "wer_improvement": None,
+            "convergence_step": None, "final_train_loss": None,
+            "min_train_loss": None,
+            "experiment": run_dir.name, "path": str(run_dir),
+            "language": language, "learning_rate": lr,
+            "seed": seed, "method": method
+        }])
+
+    df = parse_trainer_state_to_steps_df(state_file)
+    df["experiment"] = run_dir.name
+    df["path"] = str(run_dir)
+    df["language"] = language
+    df["learning_rate"] = lr
+    df["seed"] = seed
+    df["method"] = method
+    return df
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--exp_dir", type=Path, required=True,
-                       help="directory containing experiment folders")
-    parser.add_argument("--output_dir", type=Path, required=True)
-    
+    parser = argparse.ArgumentParser(description="Create step-level and run-level training result tables.")
+    parser.add_argument("--model_dir", type=Path, required=True,
+                        help="Directory containing experiment folders (each with checkpoints).")
+    parser.add_argument("--output_dir", type=Path, required=True,
+                        help="Where to write the CSVs.")
     args = parser.parse_args()
+
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # find all experiment directories
-    exp_dirs = []
-    for path in args.exp_dir.iterdir():
-        if path.is_dir():
-            # check if it contains model files
-            if any((path / f).exists() for f in ["config.json", "best/config.json", "final/config.json"]):
-                exp_dirs.append(path)
-    
-    print(f"found {len(exp_dirs)} experiments to analyze")
-    
-    # analyze each experiment
-    all_results = []
-    for exp_dir in exp_dirs:
-        print(f"analyzing {exp_dir.name}...")
+
+    # find trainer_state.json
+    best_states = list(args.model_dir.rglob("best/trainer_state.json"))
+    run_dirs = sorted({p.parent.parent for p in best_states})
+    if not run_dirs:
+        any_states = list(args.model_dir.rglob("*/trainer_state.json"))
+        run_dirs = sorted({p.parent.parent for p in any_states})
+
+    print(f"found {len(run_dirs)} experiments to analyze")
+
+    per_run_frames: List[pd.DataFrame] = []
+    for run_dir in run_dirs:
+        print(f"analyzing {run_dir.name}...")
         try:
-            results = analyze_experiment(exp_dir)
-            all_results.append(results)
+            per_run_frames.append(analyze_run_dir(run_dir))
         except Exception as e:
             print(f"  failed: {e}")
-            continue
-    
-    if not all_results:
+
+    if not per_run_frames:
         print("no results to analyze")
         return
-    
-    # create dataframe
-    df = pd.DataFrame(all_results)
-    df.to_csv(args.output_dir / "training_analysis.csv", index=False)
-    
-    # display summary
-    print("training analysis summary")
-    
-    # overall best model
-    if "best_wer" in df.columns:
-        best_idx = df["best_wer"].idxmin()
-        best = df.loc[best_idx]
-        print(f"\nbest model overall:")
-        print(f"  experiment: {best['experiment']}")
-        print(f"  wer: {best['best_wer']:.2f}%")
-        if "convergence_step" in best:
-            print(f"  convergence: step {best['convergence_step']}")
-    
-    # comparison by method
-    if "method" in df.columns and "best_wer" in df.columns:
-        print("\nby training method:")
-        method_summary = df.groupby("method")["best_wer"].agg(["mean", "std", "min"])
-        print(method_summary)
-    
-    # comparison by language
-    if "language" in df.columns and "best_wer" in df.columns:
-        print("\nby language:")
-        lang_summary = df.groupby("language")["best_wer"].agg(["mean", "std", "min"])
-        print(lang_summary)
-    
-    # convergence analysis
-    if "convergence_step" in df.columns:
-        print("\nconvergence analysis:")
-        conv_df = df.dropna(subset=["convergence_step"])
-        if not conv_df.empty:
-            avg_conv = conv_df["convergence_step"].mean()
-            print(f"  average convergence: step {avg_conv:.0f}")
-            
-            if "method" in conv_df.columns:
-                conv_by_method = conv_df.groupby("method")["convergence_step"].mean()
-                print("\n  by method:")
-                for method, step in conv_by_method.items():
-                    print(f"    {method}: step {step:.0f}")
-    
-    # wer improvement analysis
-    if "wer_improvement" in df.columns:
-        print("\nwer improvement from initial:")
-        imp_df = df.dropna(subset=["wer_improvement"])
-        if not imp_df.empty:
-            avg_imp = imp_df["wer_improvement"].mean()
-            print(f"  average improvement: {avg_imp:.2f}%")
-            
-            if "method" in imp_df.columns:
-                imp_by_method = imp_df.groupby("method")["wer_improvement"].mean()
-                print("\n  by method:")
-                for method, imp in imp_by_method.items():
-                    print(f"    {method}: {imp:.2f}%")
-    
-    # seed variance analysis
-    if "seed" in df.columns and "best_wer" in df.columns:
-        print("\nseed variance analysis:")
-        # group by everything except seed
-        grouping_cols = [col for col in ["experiment", "method", "language"] if col in df.columns]
-        if grouping_cols:
-            for name, group in df.groupby(grouping_cols[0] if len(grouping_cols) == 1 else grouping_cols):
-                if len(group) > 1:  # multiple seeds
-                    wer_std = group["best_wer"].std()
-                    wer_mean = group["best_wer"].mean()
-                    print(f"  {name}: {wer_mean:.2f}% ± {wer_std:.2f}%")
 
+    # steps table
+    steps_df = pd.concat(per_run_frames, ignore_index=True)
+    if "learning_rate" in steps_df:
+        steps_df["learning_rate"] = pd.to_numeric(steps_df["learning_rate"], errors="coerce").round(8)
+    if "step" in steps_df:
+        steps_df["step"] = pd.to_numeric(steps_df["step"], errors="coerce")
+
+    steps_csv_path = args.output_dir / "training_results_steps.csv"
+    steps_df.to_csv(steps_csv_path, index=False)
+    print(f"Saved steps dataset with {len(steps_df):,} rows -> {steps_csv_path}")
+
+    # runs table
+    runs_df = (
+        steps_df.sort_values(["experiment", "step"])
+        .groupby("experiment", as_index=False)
+        .agg(
+            path=("path", "first"),
+            language=("language", "first"),
+            learning_rate=("learning_rate", "first"),
+            seed=("seed", "first"),
+            method=("method", "first"),
+            best_metric=("best_metric", "first"),
+            best_model_checkpoint=("best_model_checkpoint", "first"),
+            global_step=("global_step", "first"),
+            epoch=("epoch", "first"),
+            best_wer=("best_wer", "first"),
+            best_wer_step=("best_wer_step", "first"),
+            final_wer=("final_wer", "first"),
+            wer_improvement=("wer_improvement", "first"),
+            convergence_step=("convergence_step", "first"),
+            final_train_loss=("final_train_loss", "first"),
+            min_train_loss=("min_train_loss", "first"),
+            n_eval_points=("wer", lambda s: s.notna().sum()),
+            n_train_points=("train_loss", lambda s: s.notna().sum()),
+            min_step=("step", "min"),
+            max_step=("step", "max"),
+        )
+    )
+
+    runs_csv_path = args.output_dir / "training_results_runs.csv"
+    runs_df.to_csv(runs_csv_path, index=False)
+    print(f"Saved runs dataset with {len(runs_df):,} rows -> {runs_csv_path}")
+
+    plots_output_path = args.output_dir / "plots"
+    plots_output_path.mkdir(parents=True, exist_ok=True)
+    plot_eval.create_all_plots_from_steps_csv(
+        steps_csv_path,
+        plots_output_path
+    )
 
 if __name__ == "__main__":
     main()
