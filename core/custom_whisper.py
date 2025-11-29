@@ -7,7 +7,8 @@ from transformers import (
     WhisperProcessor, 
     WhisperTokenizer,
     WhisperFeatureExtractor,
-    WhisperForConditionalGeneration
+    WhisperForConditionalGeneration,
+    pipeline
 )
 
 
@@ -47,6 +48,26 @@ class CustomWhisperTokenizer(WhisperTokenizer):
         
         return tokenizer
 
+def build_forced_decoder_ids(tokenizer, lang_code: str, task: str = "transcribe", no_timestamps: bool = True):
+    lang_tok = tokenizer.convert_tokens_to_ids(f"<|{lang_code}|>")
+    if lang_tok is None or lang_tok < 0:
+        raise ValueError(f"Language token <|{lang_code}|> not found. Make sure you added it first.")
+
+    forced = []
+    # position 1: language token
+    forced.append([1, lang_tok])
+
+    # position 2: task token
+    task_tok = tokenizer.convert_tokens_to_ids("<|transcribe|>" if task == "transcribe" else "<|translate|>")
+    forced.append([2, task_tok])
+
+    # position 3: notimestamps
+    if no_timestamps:
+        nt_tok = tokenizer.convert_tokens_to_ids("<|notimestamps|>")
+        forced.append([3, nt_tok])
+
+    return forced
+
 
 class CustomWhisperProcessor(WhisperProcessor):
     # processor that uses CustomWhisperTokenizer and handles language token addition
@@ -78,6 +99,7 @@ class CustomWhisperProcessor(WhisperProcessor):
         
         return cls(feature_extractor=feature_extractor, tokenizer=tokenizer)
     
+    
     def add_language_token(self, model, lang_code, init_vector=None):
         
         lang_code = lang_code.strip().lower()
@@ -103,6 +125,7 @@ class CustomWhisperProcessor(WhisperProcessor):
         
         # optional initialization vector
         if init_vector is not None and token_id >= 0:
+            print("Setting new embedding...")
             with torch.no_grad():
                 model.get_input_embeddings().weight[token_id] = init_vector.to(model.device)
                 model.get_output_embeddings().weight[token_id] = init_vector.to(model.device)
@@ -119,19 +142,47 @@ class CustomWhisperProcessor(WhisperProcessor):
         print(f"Token ID for {lang_token}: {token_id}")
         return token_id
 
+    def build_transcription_pipeline(self, model, lang_code = None, batch_size = 8):
+        
+        forced = model.generation_config.forced_decoder_ids
 
-def setup_model_with_custom_language(model_name, lang_code):
+        if not forced or lang_code:
+            prompt_ids = [model.config.decoder_start_token_id] + \
+            self.tokenizer.convert_tokens_to_ids([f"<|{lang_code}|>", "<|transcribe|>", "<|notimestamps|>"])
+
+        else:
+            print("forced_decoder_ids (pos,token):",
+                [(p, self.tokenizer.decode([t], skip_special_tokens=False))
+                for p,t in forced])
+            prompt_ids = [model.config.decoder_start_token_id] + [tok for _, tok in forced if tok is not None]
+
+        decoder_input_ids = torch.tensor([prompt_ids], device=model.device)
+        model.generation_config.forced_decoder_ids = None # remove previous model settings from fine-tuning
+
+        pipe = pipeline(
+            "automatic-speech-recognition",
+            model=model,
+            tokenizer=self.tokenizer,
+            feature_extractor=self.feature_extractor,
+        )
+        
+        def configured_pipe(audio,  batch_size = batch_size, **kwargs):
+            default_kwargs = {"decoder_input_ids": decoder_input_ids}
+            default_kwargs.update(kwargs) 
+            return pipe(audio, generate_kwargs=default_kwargs, batch_size=batch_size)
+        
+        return configured_pipe
+     
+
+def setup_model_with_custom_language(model_name, lang_code, init_vector=None):
     
     processor = CustomWhisperProcessor.from_pretrained(model_name)
     model = WhisperForConditionalGeneration.from_pretrained(model_name)
     
-    token_id = processor.add_language_token(model, lang_code)
+    token_id = processor.add_language_token(model, lang_code, init_vector)
     
-    prefix_tokens = get_prefix_tokens(processor.tokenizer, lang_code)
-    prefix_pos_id = [[i, t] for i, t in enumerate(prefix_tokens)]
-
-    model.generation_config.forced_decoder_ids = prefix_pos_id
-    model.config.forced_decoder_ids = prefix_pos_id
+    forced = build_forced_decoder_ids(processor.tokenizer, lang_code=lang_code, task="transcribe", no_timestamps=True)
+    model.generation_config.forced_decoder_ids = forced
 
     return model, processor, token_id
 
@@ -202,6 +253,17 @@ def main():
     processor.save_pretrained(out_dir)
     model.save_pretrained(out_dir)
     
+    print("SOT id (tokenizer.bos_token_id):", processor.tokenizer.bos_token_id)
+    print("decoder_start_token_id:", model.generation_config.decoder_start_token_id)
+    print("That token decodes to:", processor.tokenizer.decode(
+        [model.generation_config.decoder_start_token_id], skip_special_tokens=False)
+    )
+
+    print("forced_decoder_ids (pos,id):", model.generation_config.forced_decoder_ids)
+    print("forced_decoder_ids (pos,token):",
+        [(p, processor.tokenizer.decode([t], skip_special_tokens=False))
+        for p,t in model.generation_config.forced_decoder_ids])
+
     # saved files
     print(f"\nSaved files:")
     for file in sorted(os.listdir(out_dir)):
