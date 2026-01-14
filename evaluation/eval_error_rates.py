@@ -10,7 +10,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 import evaluation.eval_training as train_eval
-import core.new_custom_whisper as custom
+import core.custom_whisper as custom
 
 def find_model_paths(baseline_model, model_dir):
 
